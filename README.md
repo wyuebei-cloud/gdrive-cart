@@ -1,4 +1,4 @@
-# GDrive Context Cart (Context Bridge)
+# GDrive Context Cart 
 
 A lightweight visual context staging bridge connecting cloud storage and AI coding agents (Hermes, Claude Code, Cursor, OpenClaw, Codex, etc.).
 
