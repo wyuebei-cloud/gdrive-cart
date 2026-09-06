@@ -1,0 +1,21 @@
+# Credentials & tokens (never commit)
+google_token.json
+google_client_secret.json
+*.token
+*.secret
+
+# Staging output directories
+context_*/
+downloads/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# Editor & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
