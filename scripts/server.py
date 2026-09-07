@@ -61,6 +61,19 @@ def resolve_token_path() -> Path:
 TOKEN_PATH = resolve_token_path()
 HOST, PORT = "127.0.0.1", 8765
 
+# Idle auto-shutdown: server exits after IDLE_TIMEOUT seconds without any
+# HTTP request.  Configure via env GDRIVE_CART_IDLE_TIMEOUT (seconds);
+# 0 disables auto-shutdown.  Default 1800s = 30 min.
+def _idle_timeout() -> int:
+    raw = os.environ.get("GDRIVE_CART_IDLE_TIMEOUT", "")
+    try:
+        return max(0, int(raw)) if raw.strip() else 1800
+    except ValueError:
+        return 1800
+
+IDLE_TIMEOUT = _idle_timeout()
+last_activity = time.time()
+
 FOLDER_MIME = "application/vnd.google-apps.folder"
 _FID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -1802,7 +1815,9 @@ loadFolder("root");
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
-        pass
+        # Every HTTP request passes through here; refresh the idle timer.
+        global last_activity
+        last_activity = time.time()
 
     def _send(self, status: int, body: bytes, ctype: str):
         self.send_response(status)
@@ -1963,6 +1978,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": str(e)}, 500)
 
 
+def _idle_watchdog(srv):
+    """Daemon: after IDLE_TIMEOUT seconds with no HTTP request, shut down."""
+    if IDLE_TIMEOUT <= 0:
+        return
+    while True:
+        time.sleep(5)
+        idle_for = time.time() - last_activity
+        if idle_for >= IDLE_TIMEOUT:
+            print(f"Idle for {idle_for:.0f}s (limit {IDLE_TIMEOUT}s) — shutting down")
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
+            return
+
+
 def main():
     try:
         srv = ThreadingHTTPServer((HOST, PORT), Handler)
@@ -1974,6 +2005,11 @@ def main():
     url = f"http://{HOST}:{PORT}"
     print(f"GDrive Context Cart running at: {url}")
     print(f"Token location: {TOKEN_PATH}")
+    if IDLE_TIMEOUT > 0:
+        print(f"Idle auto-shutdown: {IDLE_TIMEOUT}s (set GDRIVE_CART_IDLE_TIMEOUT to change, 0=disable)")
+        threading.Thread(target=_idle_watchdog, args=(srv,), daemon=True).start()
+    else:
+        print("Idle auto-shutdown: disabled (GDRIVE_CART_IDLE_TIMEOUT=0)")
 
     try:
         webbrowser.open(url)
@@ -1984,6 +2020,8 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        srv.server_close()
 
 
 if __name__ == "__main__":
