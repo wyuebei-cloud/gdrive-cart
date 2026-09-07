@@ -1702,11 +1702,11 @@ $("#btn-start-download").addEventListener("click", async () => {
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
 
-      const parts = buffer.split("\n\n");
+      const parts = buffer.split("\\n\\n");
       buffer = parts.pop() || "";
 
       for (const block of parts) {
-        for (const line of block.split("\n")) {
+        for (const line of block.split("\\n")) {
           if (line.startsWith("data: ")) {
             try {
               const evt = JSON.parse(line.slice(6));
