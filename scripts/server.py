@@ -19,6 +19,7 @@ resolve_token_path). Standard library HTTP server + googleapiclient.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import mimetypes
 import os
@@ -32,6 +33,7 @@ import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -65,6 +67,7 @@ _FID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 EXPORT_MAP = {
     "application/vnd.google-apps.document": ("text/markdown", "md"),
     "application/vnd.google-apps.spreadsheet": ("text/csv", "csv"),
+    "application/vnd.google-apps.presentation": ("application/pdf", "pdf"),
     "application/vnd.google-apps.slides": ("application/pdf", "pdf"),
     "application/vnd.google-apps.drawing": ("image/png", "png"),
     "application/vnd.google-apps.script": ("application/json", "json"),
@@ -78,7 +81,14 @@ NODOWNLOAD = {
 }
 
 _service_lock = threading.Lock()
+_token_file_lock = threading.Lock()
 _cached_service = None
+
+_WIN_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+}
 
 
 def get_default_context_dir() -> Path:
@@ -88,8 +98,36 @@ def get_default_context_dir() -> Path:
 
 
 def sanitize_filename(name: str) -> str:
-    cleaned = re.sub(r'[\\/*?:"<>|]', "_", name).strip()
+    cleaned = re.sub(r'[\x00-\x1f\\/*?:"<>|]', "_", name)
+    cleaned = cleaned.strip(" .")
+    if not cleaned:
+        return "unnamed_file"
+
+    # Defend against Windows reserved device names (e.g. CON, con.txt, aux.tar.gz)
+    parts = cleaned.split(".")
+    base_stem = parts[0].upper()
+    if base_stem in _WIN_RESERVED:
+        parts[0] = f"{parts[0]}_"
+        cleaned = ".".join(parts)
+
     return cleaned or "unnamed_file"
+
+
+def escape_manifest_str(text: str) -> str:
+    """Sanitizes text for inclusion in Markdown manifest to prevent prompt injection and markup breaking."""
+    if not text:
+        return ""
+    flattened = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ").strip()
+    return flattened.replace("`", "'")
+
+
+def save_token_atomic(token_path: Path, payload: dict) -> None:
+    """Atomically writes token payload to token_path under thread lock."""
+    with _token_file_lock:
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = token_path.with_suffix(f".tmp.{os.getpid()}_{threading.get_ident()}")
+        tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp_path, token_path)
 
 
 def format_size(bytes_num: int | None) -> str:
@@ -127,9 +165,12 @@ def get_service():
         creds = Credentials.from_authorized_user_file(str(TOKEN_PATH))
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            payload = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
+            try:
+                payload = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                payload = {}
             payload.update({k: v for k, v in json.loads(creds.to_json()).items() if v is not None})
-            TOKEN_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            save_token_atomic(TOKEN_PATH, payload)
         if not creds.valid:
             raise RuntimeError("Drive auth is invalid. Please re-authenticate via google-workspace skill.")
         _cached_service = build("drive", "v3", credentials=creds)
@@ -177,8 +218,8 @@ def folder_info(folder_id):
     return {"id": f["id"], "name": f["name"]}
 
 
-def download_single_file(svc, file_id: str, dest_path: Path, mime_type: str) -> tuple[str, int]:
-    """Downloads or exports a single Drive file to local path. Returns (format_desc, bytes_written)."""
+def download_single_file(svc, file_id: str, dest_path: Path, mime_type: str) -> tuple[str, int, str]:
+    """Downloads or exports a single Drive file to local path. Returns (format_desc, bytes_written, sha256_hex)."""
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     if mime_type in NODOWNLOAD:
         raise RuntimeError(f"Cannot download item of type {mime_type}")
@@ -195,60 +236,168 @@ def download_single_file(svc, file_id: str, dest_path: Path, mime_type: str) -> 
 
     data_bytes = data if isinstance(data, (bytes, bytearray)) else (data.encode("utf-8") if isinstance(data, str) else b"")
     dest_path.write_bytes(data_bytes)
-    return desc, len(data_bytes)
+    sha256_hex = hashlib.sha256(data_bytes).hexdigest()
+    return desc, len(data_bytes), sha256_hex
 
 
-def resolve_and_download_item(svc, item: dict, target_root: Path, rel_dir: Path = Path("")) -> list[dict]:
-    """Recursively processes a file or folder and downloads to target directory."""
+def resolve_and_download_item(
+    svc,
+    item: dict,
+    target_root: Path,
+    rel_dir: Path = Path(""),
+    reserved: set[Path] | None = None,
+    errors: list[dict] | None = None,
+    on_progress: Callable[[dict], None] | None = None,
+) -> list[dict]:
+    """Recursively processes a file or folder and downloads to target directory with collision avoidance and error isolation."""
+    if reserved is None:
+        reserved = set()
+    if errors is None:
+        errors = []
+
     item_mime = item.get("mimeType", "")
     item_name = item.get("name", "unnamed")
-    item_id = item["id"]
+    item_id = item.get("id", "")
 
     results = []
     if item_mime == FOLDER_MIME:
-        folder_clean_name = sanitize_filename(item_name)
-        new_rel_dir = rel_dir / folder_clean_name
-        (target_root / new_rel_dir).mkdir(parents=True, exist_ok=True)
-        children = _list_all(svc, f"'{item_id}' in parents and trashed = false")
-        for child in children:
-            results.extend(resolve_and_download_item(svc, child, target_root, new_rel_dir))
-    else:
-        clean_name = sanitize_filename(item_name)
-        if item_mime in EXPORT_MAP:
-            _, ext = EXPORT_MAP[item_mime]
-            if not clean_name.lower().endswith(f".{ext}"):
-                clean_name = f"{clean_name}.{ext}"
+        try:
+            folder_clean_name = sanitize_filename(item_name)
+            dest_dir = target_root / rel_dir
+            target_folder = dest_dir / folder_clean_name
 
-        dest_file = target_root / rel_dir / clean_name
-        desc, bytes_written = download_single_file(svc, item_id, dest_file, item_mime)
-        rel_file_path = (rel_dir / clean_name).as_posix()
-        results.append({
-            "id": item_id,
-            "original_name": item_name,
-            "local_name": clean_name,
-            "relative_path": rel_file_path,
-            "size_bytes": bytes_written,
-            "size_formatted": format_size(bytes_written),
-            "format_desc": desc,
-            "mime_type": item_mime,
-            "modified_time": item.get("modifiedTime", ""),
-            "web_link": item.get("webViewLink", f"https://drive.google.com/open?id={item_id}"),
-        })
+            # If a non-directory (e.g. file) already exists here or is reserved, disambiguate folder name
+            if (target_folder.exists() and not target_folder.is_dir()) or target_folder in reserved:
+                counter = 1
+                while True:
+                    candidate_name = f"{folder_clean_name} ({counter})"
+                    candidate_folder = dest_dir / candidate_name
+                    if not candidate_folder.exists() and candidate_folder not in reserved:
+                        folder_clean_name = candidate_name
+                        target_folder = candidate_folder
+                        break
+                    counter += 1
+
+            reserved.add(target_folder)
+            target_folder.mkdir(parents=True, exist_ok=True)
+            new_rel_dir = rel_dir / folder_clean_name
+
+            if on_progress:
+                on_progress({
+                    "action": "entering_folder",
+                    "name": item_name,
+                    "rel_dir": new_rel_dir.as_posix(),
+                })
+
+            children = _list_all(svc, f"'{item_id}' in parents and trashed = false")
+            for child in children:
+                results.extend(resolve_and_download_item(
+                    svc, child, target_root, new_rel_dir, reserved=reserved, errors=errors, on_progress=on_progress
+                ))
+        except Exception as e:
+            err_dict = {
+                "id": item_id,
+                "name": item_name,
+                "path": (rel_dir / item_name).as_posix(),
+                "error": str(e),
+            }
+            errors.append(err_dict)
+            if on_progress:
+                on_progress({"action": "error", "item": err_dict})
+    else:
+        try:
+            clean_name = sanitize_filename(item_name)
+            if item_mime in EXPORT_MAP:
+                _, ext = EXPORT_MAP[item_mime]
+                if not clean_name.lower().endswith(f".{ext}"):
+                    clean_name = f"{clean_name}.{ext}"
+
+            dest_dir = target_root / rel_dir
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_file = dest_dir / clean_name
+
+            # Avoid collision: if target exists on disk (file or dir) or has been reserved in this batch
+            if dest_file.exists() or dest_file in reserved:
+                p = Path(clean_name)
+                stem, suffix = p.stem, p.suffix
+                counter = 1
+                while True:
+                    candidate_name = f"{stem} ({counter}){suffix}"
+                    candidate_file = dest_dir / candidate_name
+                    if not candidate_file.exists() and candidate_file not in reserved:
+                        clean_name = candidate_name
+                        dest_file = candidate_file
+                        break
+                    counter += 1
+
+            reserved.add(dest_file)
+
+            if on_progress:
+                on_progress({
+                    "action": "downloading",
+                    "name": item_name,
+                    "local_name": clean_name,
+                    "rel_path": (rel_dir / clean_name).as_posix(),
+                    "mime": item_mime,
+                })
+
+            desc, bytes_written, sha256_hex = download_single_file(svc, item_id, dest_file, item_mime)
+            rel_file_path = (rel_dir / clean_name).as_posix()
+
+            if on_progress:
+                on_progress({
+                    "action": "file_completed",
+                    "name": clean_name,
+                    "rel_path": rel_file_path,
+                    "bytes": bytes_written,
+                    "size_formatted": format_size(bytes_written),
+                })
+
+            results.append({
+                "id": item_id,
+                "original_name": item_name,
+                "local_name": clean_name,
+                "relative_path": rel_file_path,
+                "size_bytes": bytes_written,
+                "size_formatted": format_size(bytes_written),
+                "sha256": sha256_hex,
+                "format_desc": desc,
+                "mime_type": item_mime,
+                "modified_time": item.get("modifiedTime", ""),
+                "web_link": item.get("webViewLink", f"https://drive.google.com/open?id={item_id}"),
+            })
+        except Exception as e:
+            err_dict = {
+                "id": item_id,
+                "name": item_name,
+                "path": (rel_dir / item_name).as_posix(),
+                "error": str(e),
+            }
+            errors.append(err_dict)
+            if on_progress:
+                on_progress({"action": "error", "item": err_dict})
     return results
 
 
-def build_manifest(target_dir: Path, downloaded_files: list[dict], account_email: str = "") -> Path:
-    """Generates an agent-friendly _context_manifest.md and _manifest.json."""
+def build_manifest(target_dir: Path, downloaded_files: list[dict], account_email: str = "", errors: list[dict] | None = None) -> Path:
+    """Generates an agent-friendly _context_manifest.md and _manifest.json with prompt-injection defense."""
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    total_bytes = sum(f["size_bytes"] for f in downloaded_files)
+    total_bytes = sum(f.get("size_bytes", 0) for f in downloaded_files)
+    safe_account = escape_manifest_str(account_email)
+    safe_target_dir = escape_manifest_str(str(target_dir))
 
     md_lines = [
         "# 任务上下文清单 (Context Manifest)",
         "",
         f"- **生成时间**: {now_str}",
-        f"- **来源平台**: Google Drive" + (f" ({account_email})" if account_email else ""),
-        f"- **本地根路径**: `{target_dir}`",
-        f"- **文件总数**: {len(downloaded_files)} 项 (总大小: {format_size(total_bytes)})",
+        f"- **来源平台**: Google Drive" + (f" (`{safe_account}`)" if safe_account else ""),
+        f"- **本地根路径**: `{safe_target_dir}`",
+        f"- **成功文件总数**: {len(downloaded_files)} 项 (总大小: {format_size(total_bytes)})",
+    ]
+    if errors:
+        md_lines.append(f"- **失败条目**: {len(errors)} 项")
+
+    md_lines.extend([
         "",
         "> 提示 (Note for Agent):",
         "> 本清单汇总了由人类挑选并拉取到本地的任务上下文文件。",
@@ -258,19 +407,43 @@ def build_manifest(target_dir: Path, downloaded_files: list[dict], account_email
         "",
         "## 文件条目明细",
         "",
-    ]
+    ])
 
     for idx, f in enumerate(downloaded_files, start=1):
+        safe_local_name = escape_manifest_str(f.get("local_name", ""))
+        safe_rel_path = escape_manifest_str(f.get("relative_path", ""))
+        safe_orig_name = escape_manifest_str(f.get("original_name", ""))
+        safe_link = escape_manifest_str(f.get("web_link", ""))
+        safe_format = escape_manifest_str(f.get("format_desc", ""))
+        safe_mod_time = escape_manifest_str(f.get("modified_time", ""))
+
         md_lines.extend([
-            f"### {idx}. {f['local_name']}",
-            f"- **本地相对路径**: `{f['relative_path']}`",
-            f"- **文件大小**: {f['size_formatted']}",
-            f"- **格式转换**: {f['format_desc']}",
-            f"- **原始云端名称**: {f['original_name']}",
-            f"- **云端最后修改**: {f['modified_time']}",
-            f"- **云端链接**: [在 Google Drive 查看]({f['web_link']})",
+            f"### {idx}. `{safe_local_name}`",
+            f"- **本地相对路径**: `{safe_rel_path}`",
+            f"- **文件大小**: {f.get('size_formatted', '—')}",
+            f"- **SHA-256**: `{f.get('sha256', '—')}`",
+            f"- **格式转换**: {safe_format}",
+            f"- **原始云端名称**: `{safe_orig_name}`",
+            f"- **云端最后修改**: {safe_mod_time}",
+            f"- **云端链接**: [在 Google Drive 查看]({safe_link})",
             "",
         ])
+
+    if errors:
+        md_lines.extend([
+            "---",
+            "",
+            "## 下载或转换失败项 (Failed Items)",
+            "",
+        ])
+        for idx, err in enumerate(errors, start=1):
+            safe_err_name = escape_manifest_str(err.get("name", "unnamed"))
+            safe_err_id = escape_manifest_str(err.get("id", ""))
+            safe_err_msg = escape_manifest_str(err.get("error", ""))
+            md_lines.extend([
+                f"- **{idx}. `{safe_err_name}`** (ID: `{safe_err_id}`): 错误信息: `{safe_err_msg}`",
+            ])
+        md_lines.append("")
 
     manifest_md_path = target_dir / "_context_manifest.md"
     manifest_md_path.write_text("\n".join(md_lines), encoding="utf-8")
@@ -284,6 +457,7 @@ def build_manifest(target_dir: Path, downloaded_files: list[dict], account_email
             "total_files": len(downloaded_files),
             "total_bytes": total_bytes,
             "files": downloaded_files,
+            "errors": errors or [],
         }, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -660,8 +834,15 @@ PAGE = """<!doctype html>
       <button class="primary" id="btn-start-download" style="padding: 10px; font-size: 14px;">
         <span data-i18n="startDownload">🚀 一键拉取素材并复制路径</span>
       </button>
-      <div id="download-spinner" style="display: none;" class="download-progress">
-        <span data-i18n="downloadProgress">⏳ 正在排队下载与格式转换中...</span>
+      <div id="download-spinner" style="display: none; flex-direction: column; gap: 8px; width: 100%; box-sizing: border-box;" class="download-progress">
+        <div style="display: flex; justify-content: space-between; align-items: center; font-size: 12px; font-weight: 500;">
+          <span id="download-status-text">⏳ 正在初始化下载...</span>
+          <span id="download-count-text" style="color: var(--primary, #2563eb); font-weight: 600;">0 完成</span>
+        </div>
+        <div style="width: 100%; height: 6px; background: rgba(0,0,0,0.08); border-radius: 3px; overflow: hidden;">
+          <div id="download-progress-bar" style="width: 10%; height: 100%; background: var(--primary, #2563eb); border-radius: 3px; transition: width 0.2s ease;"></div>
+        </div>
+        <div id="download-current-file" style="font-size: 11px; color: var(--muted, #64748b); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left;"></div>
       </div>
     </div>
   </div>
@@ -985,7 +1166,7 @@ function typeBadge(m) {
   if (m === "application/vnd.google-apps.folder") return tt("typeFolder");
   if (m === "application/vnd.google-apps.document") return tt("typeDoc");
   if (m === "application/vnd.google-apps.spreadsheet") return tt("typeSheet");
-  if (m === "application/vnd.google-apps.slides") return tt("typeSlides");
+  if (m === "application/vnd.google-apps.presentation" || m === "application/vnd.google-apps.slides") return tt("typeSlides");
   if (m.startsWith("image/")) return tt("typeImage");
   if (m === "application/pdf") return tt("typePdf");
   return (m.split("/").pop().toUpperCase() || tt("typeOther")) + ` (${tt("typeRaw")})`;
@@ -1483,12 +1664,21 @@ $("#btn-start-download").addEventListener("click", async () => {
 
   const btn = $("#btn-start-download");
   const spinner = $("#download-spinner");
+  const statusText = $("#download-status-text");
+  const countText = $("#download-count-text");
+  const progressBar = $("#download-progress-bar");
+  const curFileText = $("#download-current-file");
+
   btn.disabled = true;
   btn.style.display = "none";
   spinner.style.display = "flex";
+  progressBar.style.width = "5%";
+  statusText.textContent = state.lang === "en" ? "Initializing download..." : "正在初始化下载...";
+  countText.textContent = "";
+  curFileText.textContent = "";
 
   try {
-    const res = await api("/api/batch-download", {
+    const response = await fetch("/api/batch-download", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1497,14 +1687,77 @@ $("#btn-start-download").addEventListener("click", async () => {
       })
     });
 
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    let completePayload = null;
+    let completedCount = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() || "";
+
+      for (const block of parts) {
+        for (const line of block.split("\n")) {
+          if (line.startsWith("data: ")) {
+            try {
+              const evt = JSON.parse(line.slice(6));
+              if (evt.type === "init") {
+                statusText.textContent = state.lang === "en" ? "Scanning & staging files..." : "正在排队扫描与下载素材...";
+                progressBar.style.width = "10%";
+              } else if (evt.type === "progress") {
+                if (evt.action === "entering_folder") {
+                  curFileText.textContent = `📂 ${evt.name}`;
+                } else if (evt.action === "downloading") {
+                  curFileText.textContent = `⬇️ ${evt.name}`;
+                  statusText.textContent = state.lang === "en" ? "Downloading & converting..." : "正在下载与转译格式...";
+                } else if (evt.action === "file_completed") {
+                  completedCount++;
+                  countText.textContent = state.lang === "en" ? `${completedCount} completed` : `已完成 ${completedCount} 项`;
+                  curFileText.textContent = `✓ ${evt.name} (${evt.size_formatted || ""})`;
+                  const pct = Math.min(90, 10 + completedCount * 8);
+                  progressBar.style.width = `${pct}%`;
+                }
+              } else if (evt.type === "complete") {
+                completePayload = evt;
+                progressBar.style.width = "100%";
+                statusText.textContent = state.lang === "en" ? "Complete!" : "下载完成！";
+              } else if (evt.type === "error") {
+                throw new Error(evt.error || "Download failed");
+              }
+            } catch (e) {
+              if (e.message && e.message.includes("Download failed")) throw e;
+            }
+          }
+        }
+      }
+    }
+
+    if (!completePayload) {
+      throw new Error(state.lang === "en" ? "Connection closed before completion" : "连接中断，未收到完成回执");
+    }
+
+    const res = completePayload;
     state.latestTargetDir = res.target_dir;
     const promptText = state.lang === "en"
       ? (res.clipboard_text_en || `The context path for this task is: ${res.target_dir}, `)
       : (res.clipboard_text || `此次任务的上下文路径在: ${res.target_dir}，`);
     $("#clipboard-preview").value = promptText;
-    
+
     const ok = await copyToClipboard(promptText);
-    $("#copy-status").textContent = ok ? tt("copyStatus") : tt("copyStatusFallback");
+    let statusMsg = ok ? tt("copyStatus") : tt("copyStatusFallback");
+    if (res.errors && res.errors.length > 0) {
+      statusMsg += (state.lang === "en" ? ` (⚠️ ${res.errors.length} failed, see manifest)` : ` (⚠️ ${res.errors.length} 项失败，详见清单)`);
+    }
+    $("#copy-status").textContent = statusMsg;
     $("#copy-status").style.display = "";
     $("#success-modal").style.display = "flex";
   } catch (err) {
@@ -1606,32 +1859,73 @@ class Handler(BaseHTTPRequestHandler):
                 if not items:
                     raise RuntimeError("No items selected in cart")
 
-                svc = get_service()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
 
-                user_email = ""
+                def send_event(data: dict):
+                    try:
+                        line = f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+                        self.wfile.write(line.encode("utf-8"))
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+
+                send_event({"type": "init", "staged_count": len(items)})
+
                 try:
-                    about = svc.about().get(fields="user(emailAddress)").execute()
-                    user_email = about.get("user", {}).get("emailAddress", "")
-                except Exception:
-                    pass
+                    svc = get_service()
 
-                downloaded = []
-                for item in items:
-                    downloaded.extend(resolve_and_download_item(svc, item, target_dir))
+                    user_email = ""
+                    try:
+                        about = svc.about().get(fields="user(emailAddress)").execute()
+                        user_email = about.get("user", {}).get("emailAddress", "")
+                    except Exception:
+                        pass
 
-                manifest_path = build_manifest(target_dir, downloaded, user_email)
-                clipboard_text = f"此次任务的上下文路径在: {target_dir}，"
-                clipboard_text_en = f"The context path for this task is: {target_dir}, "
+                    downloaded = []
+                    reserved_paths: set[Path] = set()
+                    errors = []
 
-                self._json({
-                    "success": True,
-                    "target_dir": str(target_dir),
-                    "count": len(downloaded),
-                    "manifest_path": str(manifest_path),
-                    "clipboard_text": clipboard_text,
-                    "clipboard_text_en": clipboard_text_en,
-                    "files": downloaded,
-                })
+                    def progress_cb(evt: dict):
+                        send_event({
+                            "type": "progress",
+                            "downloaded_count": len(downloaded),
+                            "errors_count": len(errors),
+                            **evt,
+                        })
+
+                    for item in items:
+                        downloaded.extend(resolve_and_download_item(
+                            svc, item, target_dir, reserved=reserved_paths, errors=errors, on_progress=progress_cb
+                        ))
+
+                    if not downloaded and errors:
+                        err_msg = "; ".join(f"{e.get('name', 'item')}: {e.get('error')}" for e in errors[:3])
+                        send_event({"type": "error", "error": f"All downloads failed: {err_msg}"})
+                        return
+
+                    manifest_path = build_manifest(target_dir, downloaded, user_email, errors=errors)
+                    clipboard_text = f"此次任务的上下文路径在: {target_dir}，"
+                    clipboard_text_en = f"The context path for this task is: {target_dir}, "
+
+                    send_event({
+                        "type": "complete",
+                        "success": True,
+                        "target_dir": str(target_dir),
+                        "count": len(downloaded),
+                        "errors_count": len(errors),
+                        "errors": errors,
+                        "manifest_path": str(manifest_path),
+                        "clipboard_text": clipboard_text,
+                        "clipboard_text_en": clipboard_text_en,
+                        "files": downloaded,
+                    })
+                except Exception as e:
+                    send_event({"type": "error", "error": str(e)})
+                return
 
             elif path == "/api/local/mkdir":
                 parent_dir = body.get("parent", "").strip()
@@ -1648,16 +1942,17 @@ class Handler(BaseHTTPRequestHandler):
 
             elif path == "/api/open-folder":
                 folder_path = body.get("path", "").strip()
-                if folder_path and Path(folder_path).exists():
+                p = Path(folder_path)
+                if folder_path and p.exists() and p.is_dir():
                     if sys.platform == "win32":
-                        os.startfile(folder_path)
+                        os.startfile(str(p))
                     elif sys.platform == "darwin":
-                        subprocess.run(["open", folder_path], check=False)
+                        subprocess.run(["open", str(p)], check=False)
                     else:
-                        subprocess.run(["xdg-open", folder_path], check=False)
+                        subprocess.run(["xdg-open", str(p)], check=False)
                     self._json({"success": True})
                 else:
-                    self._json({"error": "Folder does not exist"}, 400)
+                    self._json({"error": "Target path does not exist or is not a directory"}, 400)
             else:
                 self._json({"error": f"Endpoint not found: {path}"}, 404)
         except Exception as e:

@@ -43,7 +43,7 @@ First match wins. Any machine that completed a standard Google OAuth flow in any
 ### 1. Check / Ensure Authentication
 Verify that a token is discoverable (auth step is delegated — run once per machine):
 ```bash
-python "C:/Users/ywang/AppData/Local/hermes/skills/productivity/google-workspace/scripts/setup.py" --check
+python "<skills_path>/productivity/google-workspace/scripts/setup.py" --check
 ```
 If not authenticated, complete the OAuth flow via `google-workspace` on that machine.
 
@@ -52,7 +52,7 @@ When the user asks to open/launch GDrive Cart / Context Bridge:
 1. Check if port `8765` is already listening.
 2. If not running, start the server in the background:
    ```bash
-   python "C:/Users/ywang/AppData/Local/hermes/skills/productivity/gdrive-cart/scripts/server.py"
+   python "<skills_path>/productivity/gdrive-cart/scripts/server.py"
    ```
 3. Direct the user to the web UI at `http://127.0.0.1:8765`.
 

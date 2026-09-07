@@ -60,10 +60,16 @@ The server resolves Google OAuth credentials by checking the following locations
    ```
    Or on Windows, double-click `scripts/run.bat`.
 3. Open `http://127.0.0.1:8765` in your browser.
-4. Browse or search files, click `[+ Add]` to place items in the staging cart.
+4. Browse or search files and folders by name, click `[+ Add]` to place items in the staging cart.
 5. Select or create your local destination folder.
 6. Click **Stage Context & Copy Path**.
 7. Switch to your agent chat or terminal, press `Ctrl + V`, and append your task instructions.
+
+### Security & Threat Model
+
+- **Local Trust Boundary**: `gdrive-cart` binds exclusively to loopback (`127.0.0.1:8765`) and assumes a fully trusted single-user host. Local file system traversal and staging operations operate under the privileges of the running process.
+- **Do Not Bind to Public Interfaces**: Never bind the host to `0.0.0.0` or expose the port to external networks via port-forwarding or reverse tunnels without an upstream authentication reverse proxy.
+- **Multi-Tenant Machines**: Avoid running this tool unattended on shared multi-user workstations where untrusted local users have shell access to the loopback interface.
 
 ---
 
@@ -123,10 +129,16 @@ The server resolves Google OAuth credentials by checking the following locations
    ```
    Windows 环境下亦可直接双击 `scripts/run.bat`。
 3. 浏览器访问 `http://127.0.0.1:8765`。
-4. 浏览或搜索文件，点击 `[+ 加入]` 放入待选素材篮。
+4. 浏览或按名称搜索文件与文件夹，点击 `[+ 加入]` 放入待选素材篮。
 5. 确认或通过浏览弹窗选择/新建本地目标文件夹。
 6. 点击 **一键拉取素材并复制路径**。
 7. 切回 Agent 聊天框或终端，按 `Ctrl + V` 粘贴路径并敲入任务需求。
+
+### 安全与威胁模型说明
+
+- **本地信任假设**：`gdrive-cart` 默认仅监听本地环回地址 (`127.0.0.1:8765`)，设计前提为**完全信任当前操作系统与同机单用户环境**。本地文件目录浏览与建目录等操作均继承运行该服务的系统进程权限。
+- **严禁暴露公网**：切勿将监听地址绑定至 `0.0.0.0`，亦不要在缺少鉴权反向代理的前提下通过端口映射或内网穿透（如 ngrok/frp）暴露至外部网络。
+- **多租户与共享环境**：请勿在有不受信本地用户的共享开发机或实验室机器上长期常驻本服务。
 
 ---
 
