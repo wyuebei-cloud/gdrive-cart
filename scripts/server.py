@@ -1862,8 +1862,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "keep-alive")
+                self.send_header("Connection", "close")
                 self.end_headers()
+                # SSE 响应是一次性的: 所有事件发完后即关闭连接,
+                # 否则 keep-alive 会让前端 reader.read() 永远等不到流结束,
+                # complete 之后的收尾代码(成功弹窗)永不执行。
+                self.close_connection = True
 
                 def send_event(data: dict):
                     try:
