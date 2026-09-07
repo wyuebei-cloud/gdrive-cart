@@ -54,6 +54,9 @@ When the user asks to open/launch GDrive Cart / Context Bridge:
    ```bash
    python "<skills_path>/productivity/gdrive-cart/scripts/server.py"
    ```
+   The server auto-shuts down after 30 minutes with no activity (browser
+   requests reset the timer). Set env `GDRIVE_CART_IDLE_TIMEOUT` (seconds)
+   to override, or `0` to disable auto-shutdown.
 3. Direct the user to the web UI at `http://127.0.0.1:8765`.
 
 ### 3. User Selection & Context Hand-Off
